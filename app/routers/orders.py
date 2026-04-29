@@ -11,8 +11,6 @@ from decimal import Decimal
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
-MEAL_PRICE = Decimal("100.00")
-
 @router.post("/", response_model=OrderResponse)
 async def create_order(
     payload: OrderCreate,
@@ -24,7 +22,7 @@ async def create_order(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if user.current_balance < MEAL_PRICE:
+    if user.current_balance < payload.amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
     order = Order(
@@ -40,13 +38,13 @@ async def create_order(
         user_id=payload.user_id,
         order_id=order.id,
         type="debit",
-        amount=MEAL_PRICE,
+        amount=payload.amount,
         status="completed",
         description=payload.description or "Meal deduction"
     )
     db.add(ledger_entry)
 
-    user.current_balance -= MEAL_PRICE
+    user.current_balance -= payload.amount
     await db.commit()
     await db.refresh(order)
     return order
