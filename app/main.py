@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from app.routers import users, orders, ledger
 from app.routers import auth
@@ -7,6 +8,14 @@ app = FastAPI(
     title="KMCho API",
     description="Prepaid meal wallet — customer ledger, payments and order tracking API",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://my.kmcho.co.in"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth.router)
