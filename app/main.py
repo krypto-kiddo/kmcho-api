@@ -1,8 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from app.routers import users, orders, ledger
-from app.routers import auth
+from app.routers import users, orders, ledger, auth, profile
 
 app = FastAPI(
     title="KMCho API",

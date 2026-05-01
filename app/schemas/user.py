@@ -19,6 +19,7 @@ class UserResponse(BaseModel):
     phone: Optional[str]
     email: Optional[str]
     is_admin: bool
+    is_onboarded: bool
     current_balance: Decimal
     created_at: datetime
 
@@ -37,3 +38,17 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     user_id: Optional[int] = None
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+class OnboardingComplete(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    new_password: str
