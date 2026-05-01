@@ -25,6 +25,7 @@ app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(orders.router)
 app.include_router(ledger.router)
+app.include_router(profile.router)
 
 @app.get("/")
 async def root():
