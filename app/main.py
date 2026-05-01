@@ -12,7 +12,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://my.kmcho.co.in", "https://kmcho-web.vercel.app"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://my.kmcho.co.in",
+        "https://kmcho-web.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
