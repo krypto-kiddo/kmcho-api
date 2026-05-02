@@ -5,6 +5,7 @@ from app.database import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, Token, UserResponse
 from app.auth import hash_password, verify_password, create_access_token
+from datetime import timedelta
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -36,5 +37,6 @@ async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
             detail="Invalid email or password"
         )
 
-    token = create_access_token({"sub": str(user.id)})
+    expires = timedelta(days=30) if payload.remember_me else timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token({"sub": str(user.id)}, expires_delta=expires)
     return {"access_token": token, "token_type": "bearer"}
