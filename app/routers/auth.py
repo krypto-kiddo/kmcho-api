@@ -6,6 +6,7 @@ from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, Token, UserResponse
 from app.auth import hash_password, verify_password, create_access_token
 from datetime import timedelta
+from app.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
