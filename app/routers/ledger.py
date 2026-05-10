@@ -4,6 +4,7 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models.ledger import Ledger
 from app.models.user import User
+from app.models.order import Order
 from app.schemas.ledger import LedgerCreate, LedgerResponse, StatementResponse
 from app.auth import get_current_user, get_current_admin
 
@@ -76,4 +77,22 @@ async def get_ledger_entries(
         .where(Ledger.user_id == user_id)
         .order_by(Ledger.created_at.desc())
     )
-    return result.scalars().all()
+    entries = result.scalars().all()
+
+    # Fetch linked orders to get order_date
+    order_ids = [e.order_id for e in entries if e.order_id is not None]
+    orders_map = {}
+    if order_ids:
+        orders_result = await db.execute(
+            select(Order).where(Order.id.in_(order_ids))
+        )
+        for order in orders_result.scalars().all():
+            orders_map[order.id] = order
+
+    # Inject order_date into entries
+    for entry in entries:
+        if entry.order_id and entry.order_id in orders_map:
+            entry.created_at = orders_map[entry.order_id].order_date or entry.created_at
+
+    entries.sort(key=lambda e: e.created_at, reverse=True)
+    return entries
