@@ -22,7 +22,7 @@ async def create_order(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    MINIMUM_BALANCE = -5000
+    MINIMUM_BALANCE = -10000
 
     if user.current_balance - payload.amount < MINIMUM_BALANCE:
         raise HTTPException(status_code=400, detail="Insufficient balance")
