@@ -77,6 +77,7 @@ async def get_order(
     return order
 
 @router.patch("/{order_id}/status", response_model=OrderResponse)
+@router.patch("/{order_id}/status", response_model=OrderResponse)
 async def update_order_status(
     order_id: int,
     payload: OrderUpdateStatus,
@@ -91,6 +92,32 @@ async def update_order_status(
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    if payload.status == order.status:
+        return order
+
+    # Handle cancellation refund
+    if payload.status == "cancelled" and order.status == "pending":
+        ledger_result = await db.execute(
+            select(Ledger).where(Ledger.order_id == order_id)
+        )
+        original_entry = ledger_result.scalar_one_or_none()
+
+        if original_entry:
+            user_result = await db.execute(select(User).where(User.id == order.user_id))
+            user = user_result.scalar_one_or_none()
+
+            if user:
+                refund_entry = Ledger(
+                    user_id=order.user_id,
+                    order_id=order.id,
+                    type="refund",
+                    amount=original_entry.amount,
+                    status="completed",
+                    description=f"Refund for cancelled order #{order.id}"
+                )
+                db.add(refund_entry)
+                user.current_balance += original_entry.amount
 
     order.status = payload.status
     await db.commit()
