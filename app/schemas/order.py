@@ -21,3 +21,7 @@ class OrderResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+class OrderUpdate(BaseModel):
+    description: Optional[str] = None
+    order_date: Optional[datetime] = None

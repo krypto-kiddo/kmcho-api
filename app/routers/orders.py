@@ -5,7 +5,7 @@ from app.database import get_db
 from app.models.order import Order
 from app.models.ledger import Ledger
 from app.models.user import User
-from app.schemas.order import OrderCreate, OrderUpdateStatus, OrderResponse
+from app.schemas.order import OrderCreate, OrderUpdateStatus, OrderResponse, OrderUpdate
 from app.auth import get_current_user, get_current_admin
 from decimal import Decimal
 
@@ -76,7 +76,35 @@ async def get_order(
         raise HTTPException(status_code=403, detail="Access denied")
     return order
 
-@router.patch("/{order_id}/status", response_model=OrderResponse)
+@router.patch("/{order_id}", response_model=OrderResponse)
+async def update_order(
+    order_id: int,
+    payload: OrderUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if payload.description is not None:
+        order.description = payload.description
+        # Sync description to linked ledger entry
+        ledger_result = await db.execute(
+            select(Ledger).where(Ledger.order_id == order_id, Ledger.type == "debit")
+        )
+        ledger_entry = ledger_result.scalar_one_or_none()
+        if ledger_entry:
+            ledger_entry.description = payload.description
+
+    if payload.order_date is not None:
+        order.order_date = payload.order_date
+
+    await db.commit()
+    await db.refresh(order)
+    return order
+
 @router.patch("/{order_id}/status", response_model=OrderResponse)
 async def update_order_status(
     order_id: int,
