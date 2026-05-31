@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from app.database import get_db
 from app.models.order import Order
 from app.models.ledger import Ledger
@@ -151,3 +151,66 @@ async def update_order_status(
     await db.commit()
     await db.refresh(order)
     return order
+
+@router.patch("/{order_id}/amount")
+async def update_order_amount(
+    order_id: int,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    new_amount = payload.get("new_amount")
+    if not new_amount or float(new_amount) <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    new_amount = Decimal(str(new_amount))
+
+    async with db.begin():
+        # Fetch order
+        order_result = await db.execute(select(Order).where(Order.id == order_id))
+        order = order_result.scalar_one_or_none()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # Fetch linked debit entry
+        debit_result = await db.execute(
+            select(Ledger).where(
+                and_(Ledger.order_id == order_id, Ledger.type == "debit")
+            )
+        )
+        debit_entry = debit_result.scalar_one_or_none()
+        if not debit_entry:
+            raise HTTPException(status_code=404, detail="No ledger entry linked to this order")
+
+        old_amount = debit_entry.amount
+        difference = new_amount - old_amount  # positive = customer owes more, negative = customer gets back
+
+        # Update debit entry
+        debit_entry.amount = new_amount
+
+        if order.status == "cancelled":
+            # Find and update the refund entry too
+            refund_result = await db.execute(
+                select(Ledger).where(
+                    and_(Ledger.order_id == order_id, Ledger.type == "refund")
+                )
+            )
+            refund_entry = refund_result.scalar_one_or_none()
+            if not refund_entry:
+                raise HTTPException(status_code=404, detail="Refund entry not found for cancelled order")
+            refund_entry.amount = new_amount
+            # Balance stays the same — debit and refund cancel out
+
+        else:
+            # Adjust user balance
+            user_result = await db.execute(select(User).where(User.id == order.user_id))
+            user = user_result.scalar_one_or_none()
+            user.current_balance -= difference  # if difference is positive, balance goes down
+
+        # Update order amount field if you have one, else just return
+        # order.amount = new_amount  # uncomment if your Order model has an amount field
+
+    return {"message": "Order amount updated", "order_id": order_id, "old_amount": str(old_amount), "new_amount": str(new_amount)}
