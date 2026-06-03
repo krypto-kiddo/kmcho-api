@@ -74,7 +74,23 @@ async def get_order(
         raise HTTPException(status_code=404, detail="Order not found")
     if not current_user.is_admin and order.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
-    return order
+
+    ledger_result = await db.execute(
+        select(Ledger).where(
+            and_(Ledger.order_id == order_id, Ledger.type == "debit")
+        )
+    )
+    ledger_entry = ledger_result.scalar_one_or_none()
+
+    return {
+        "id": order.id,
+        "user_id": order.user_id,
+        "status": order.status,
+        "description": order.description,
+        "order_date": order.order_date,
+        "created_at": order.created_at,
+        "amount": str(ledger_entry.amount) if ledger_entry else None,
+    }
 
 @router.patch("/{order_id}", response_model=OrderResponse)
 async def update_order(
@@ -168,49 +184,47 @@ async def update_order_amount(
 
     new_amount = Decimal(str(new_amount))
 
-    async with db.begin():
-        # Fetch order
-        order_result = await db.execute(select(Order).where(Order.id == order_id))
-        order = order_result.scalar_one_or_none()
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
+    # Fetch order
+    order_result = await db.execute(select(Order).where(Order.id == order_id))
+    order = order_result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-        # Fetch linked debit entry
-        debit_result = await db.execute(
+    # Fetch linked debit entry
+    debit_result = await db.execute(
+        select(Ledger).where(
+            and_(Ledger.order_id == order_id, Ledger.type == "debit")
+        )
+    )
+    debit_entry = debit_result.scalar_one_or_none()
+    if not debit_entry:
+        raise HTTPException(status_code=404, detail="No ledger entry linked to this order")
+
+    old_amount = debit_entry.amount
+    difference = new_amount - old_amount
+
+    debit_entry.amount = new_amount
+
+    if order.status == "cancelled":
+        refund_result = await db.execute(
             select(Ledger).where(
-                and_(Ledger.order_id == order_id, Ledger.type == "debit")
+                and_(Ledger.order_id == order_id, Ledger.type == "refund")
             )
         )
-        debit_entry = debit_result.scalar_one_or_none()
-        if not debit_entry:
-            raise HTTPException(status_code=404, detail="No ledger entry linked to this order")
+        refund_entry = refund_result.scalar_one_or_none()
+        if not refund_entry:
+            raise HTTPException(status_code=404, detail="Refund entry not found for cancelled order")
+        refund_entry.amount = new_amount
+    else:
+        user_result = await db.execute(select(User).where(User.id == order.user_id))
+        user = user_result.scalar_one_or_none()
+        user.current_balance -= difference
 
-        old_amount = debit_entry.amount
-        difference = new_amount - old_amount  # positive = customer owes more, negative = customer gets back
+    await db.commit()
 
-        # Update debit entry
-        debit_entry.amount = new_amount
-
-        if order.status == "cancelled":
-            # Find and update the refund entry too
-            refund_result = await db.execute(
-                select(Ledger).where(
-                    and_(Ledger.order_id == order_id, Ledger.type == "refund")
-                )
-            )
-            refund_entry = refund_result.scalar_one_or_none()
-            if not refund_entry:
-                raise HTTPException(status_code=404, detail="Refund entry not found for cancelled order")
-            refund_entry.amount = new_amount
-            # Balance stays the same — debit and refund cancel out
-
-        else:
-            # Adjust user balance
-            user_result = await db.execute(select(User).where(User.id == order.user_id))
-            user = user_result.scalar_one_or_none()
-            user.current_balance -= difference  # if difference is positive, balance goes down
-
-        # Update order amount field if you have one, else just return
-        # order.amount = new_amount  # uncomment if your Order model has an amount field
-
-    return {"message": "Order amount updated", "order_id": order_id, "old_amount": str(old_amount), "new_amount": str(new_amount)}
+    return {
+        "message": "Order amount updated",
+        "order_id": order_id,
+        "old_amount": str(old_amount),
+        "new_amount": str(new_amount)
+    }

@@ -19,6 +19,7 @@ class OrderResponse(BaseModel):
     description: Optional[str]
     order_date: Optional[datetime]
     created_at: datetime
+    amount: str | None = None
 
     model_config = {"from_attributes": True}
 
