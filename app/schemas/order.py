@@ -20,9 +20,14 @@ class OrderResponse(BaseModel):
     order_date: Optional[datetime]
     created_at: datetime
     amount: str | None = None
+    porter_link: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
 class OrderUpdate(BaseModel):
     description: Optional[str] = None
     order_date: Optional[datetime] = None
+
+class OrderUpdatePorterLink(BaseModel):
+    order_ids: list[int]
+    porter_link: Optional[str] = None

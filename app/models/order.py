@@ -1,6 +1,7 @@
 from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
+from typing import Optional
 
 class Order(Base):
     __tablename__ = "orders"
@@ -11,6 +12,7 @@ class Order(Base):
     description: Mapped[str] = mapped_column(Text, nullable=True)
     order_date: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    porter_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     user = relationship("User", back_populates="orders")
     ledger_entry = relationship("Ledger", back_populates="order", uselist=False)

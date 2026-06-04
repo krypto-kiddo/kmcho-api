@@ -5,7 +5,7 @@ from app.database import get_db
 from app.models.order import Order
 from app.models.ledger import Ledger
 from app.models.user import User
-from app.schemas.order import OrderCreate, OrderUpdateStatus, OrderResponse, OrderUpdate
+from app.schemas.order import OrderCreate, OrderUpdateStatus, OrderResponse, OrderUpdate, OrderUpdatePorterLink
 from app.auth import get_current_user, get_current_admin
 from decimal import Decimal
 
@@ -61,6 +61,31 @@ async def get_orders(
     else:
         result = await db.execute(select(Order).where(Order.user_id == current_user.id))
     return result.scalars().all()
+
+# always keep this endpoint above GET /{order_id} because of an SQLAlchemy route conflict
+@router.patch("/porter-link", response_model=list[OrderResponse])
+async def update_porter_link(
+    payload: OrderUpdatePorterLink,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    if not payload.order_ids:
+        raise HTTPException(status_code=400, detail="No order IDs provided")
+
+    result = await db.execute(select(Order).where(Order.id.in_(payload.order_ids)))
+    orders = result.scalars().all()
+
+    if len(orders) != len(payload.order_ids):
+        raise HTTPException(status_code=404, detail="One or more orders not found")
+
+    for order in orders:
+        order.porter_link = payload.porter_link
+
+    await db.commit()
+    for order in orders:
+        await db.refresh(order)
+
+    return orders
 
 @router.get("/{order_id}", response_model=OrderResponse)
 async def get_order(
@@ -228,3 +253,4 @@ async def update_order_amount(
         "old_amount": str(old_amount),
         "new_amount": str(new_amount)
     }
+
