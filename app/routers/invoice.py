@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from decimal import Decimal
 from datetime import datetime, date
 from typing import Optional
@@ -10,6 +10,7 @@ from slowapi.util import get_remote_address
 from app.database import get_db
 from app.models.user import User
 from app.models.ledger import Ledger
+from app.models.order import Order
 from app.auth import get_current_user
 from app.limiter import limiter
 
@@ -27,30 +28,29 @@ async def get_invoice(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Customers can only fetch their own invoice
     if not current_user.is_admin and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Cap the date range
     if (to_date - from_date).days > MAX_RANGE_DAYS:
         raise HTTPException(status_code=400, detail="Date range cannot exceed 90 days")
 
-    # Fetch user
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Opening balance = sum of all completed ledger entries before from_date
     from_dt = datetime.combine(from_date, datetime.min.time())
     to_dt = datetime.combine(to_date, datetime.max.time())
 
+    # Opening balance — use order_date if linked, else created_at
     all_before = await db.execute(
-        select(Ledger).where(
+        select(Ledger)
+        .outerjoin(Order, Ledger.order_id == Order.id)
+        .where(
             and_(
                 Ledger.user_id == user_id,
                 Ledger.status == "completed",
-                Ledger.created_at < from_dt
+                func.coalesce(Order.order_date, Ledger.created_at) < from_dt
             )
         )
     )
@@ -58,35 +58,41 @@ async def get_invoice(
 
     opening_balance = Decimal("0")
     for e in entries_before:
-        if e.type in ("credit",):
+        if e.type in ("credit", "refund"):
             opening_balance += e.amount
-        elif e.type in ("debit",):
+        elif e.type == "debit":
             opening_balance -= e.amount
-        elif e.type == "refund":
-            opening_balance += e.amount
 
-    # Fetch entries in range
+    # In-range entries — same coalesce, sort by effective date
     in_range = await db.execute(
-        select(Ledger).where(
+        select(Ledger, Order.order_date)
+        .outerjoin(Order, Ledger.order_id == Order.id)
+        .where(
             and_(
                 Ledger.user_id == user_id,
                 Ledger.status == "completed",
-                Ledger.created_at >= from_dt,
-                Ledger.created_at <= to_dt
+                func.coalesce(Order.order_date, Ledger.created_at) >= from_dt,
+                func.coalesce(Order.order_date, Ledger.created_at) <= to_dt
             )
-        ).order_by(Ledger.created_at)
+        )
+        .order_by(func.coalesce(Order.order_date, Ledger.created_at))
     )
-    entries = in_range.scalars().all()
+    results = in_range.all()  # list of (Ledger, order_date | None)
 
     # Build rows with running balance
     rows = []
     running = opening_balance
-    for e in entries:
+    entries_only = []  # for totals
+
+    for e, order_date in results:
+        effective_date = order_date or e.created_at
+        entries_only.append(e)
+
         if e.type == "credit":
             running += e.amount
             rows.append({
                 "id": e.id,
-                "date": e.created_at.isoformat(),
+                "date": effective_date.isoformat(),
                 "description": e.description or "Payment received",
                 "mode": e.mode_of_payment,
                 "transaction_id": e.transaction_id,
@@ -98,7 +104,7 @@ async def get_invoice(
             running -= e.amount
             rows.append({
                 "id": e.id,
-                "date": e.created_at.isoformat(),
+                "date": effective_date.isoformat(),
                 "description": e.description or "Meal deduction",
                 "mode": None,
                 "transaction_id": None,
@@ -110,7 +116,7 @@ async def get_invoice(
             running += e.amount
             rows.append({
                 "id": e.id,
-                "date": e.created_at.isoformat(),
+                "date": effective_date.isoformat(),
                 "description": e.description or "Refund",
                 "mode": None,
                 "transaction_id": None,
@@ -119,8 +125,8 @@ async def get_invoice(
                 "balance": str(running)
             })
 
-    total_credits = sum(e.amount for e in entries if e.type in ("credit", "refund"))
-    total_debits = sum(e.amount for e in entries if e.type == "debit")
+    total_credits = sum(e.amount for e in entries_only if e.type in ("credit", "refund"))
+    total_debits = sum(e.amount for e in entries_only if e.type == "debit")
 
     return {
         "user": {"id": user.id, "name": user.name, "phone": user.phone},
