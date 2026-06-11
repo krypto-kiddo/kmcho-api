@@ -49,8 +49,20 @@ async def daily_preview(
                 if not is_due(bowl["days"], date):
                     continue
 
-                protein = resolve_cycle(bowl["protein"]["cycle"], sub.protein_index)
-                base = resolve_cycle(bowl["base"]["cycle"], sub.base_index) if bowl["base"]["qty"] > 0 else None
+                protein = resolve_cycle(
+                    bowl["protein"]["cycle"],
+                    sub.protein_index,
+                    date,
+                    bowl["days"]["frequency"]
+                )
+
+                base = resolve_cycle(
+                    bowl["base"]["cycle"],
+                    sub.base_index,
+                    date,
+                    bowl["days"]["frequency"]
+                ) if bowl["base"]["qty"] > 0 else None
+                
                 qty = bowl["qty"]
 
                 # aggregate ingredients
@@ -210,10 +222,14 @@ def is_due(days: dict, date: DateType) -> bool:
     if freq == 1:
         return date.day % 2 == 0
     if freq == 2:
-        dow = date.isoweekday()  # Mon=1 .. Sun=7
+        dow = date.isoweekday()
         return dow in days["on"]
     return False
 
 
-def resolve_cycle(cycle: list, index: int) -> str:
-    return cycle[index % len(cycle)]
+def resolve_cycle(cycle: list, base_index: int, date: DateType, frequency: int) -> str:
+    if frequency == 1:
+        offset = date.day // 2
+    else:
+        offset = date.toordinal()
+    return cycle[(base_index + offset) % len(cycle)]
