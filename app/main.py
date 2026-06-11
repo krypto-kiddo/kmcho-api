@@ -25,6 +25,7 @@ app.add_middleware(
         "http://localhost:3000",
         "https://my.kmcho.co.in",
         "https://kmcho-web.vercel.app",
+        "https://chef.kmcho.co.in",
     ],
     allow_credentials=True,
     allow_methods=["*"],
