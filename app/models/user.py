@@ -8,6 +8,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     phone: Mapped[str] = mapped_column(String, nullable=True)
+    wa_phone: Mapped[str] = mapped_column(String(15), nullable=True, unique=True)  # "91XXXXXXXXXX", matches the kitchen sheet
     email: Mapped[str] = mapped_column(String, nullable=True, unique=True)
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
