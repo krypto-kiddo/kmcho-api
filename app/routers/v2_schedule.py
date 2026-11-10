@@ -6,11 +6,16 @@ GET  /v2/schedule/me     Customer's deliveries for a date range (app cards).
 Sync rules
 - A cell becomes one `deliveries` row per (dog, date). Blank cell = no row.
 - Unbilled rows follow the sheet exactly: created, updated, or deleted.
-- Billed rows (billed_ledger_id set) are locked:
-    same text                 -> nothing
-    text edit, same billable  -> applied, logged as auto_applied
-    billable flips / cleared  -> row untouched, pending DeliveryChange for an admin
-    error cell (#REF! etc.)   -> ignored, reported as an issue
+- Each cell gets a billing mode: meal -> charge; keyword -> its Keywords "Billing" value
+  (Charge / Credit / Skip, default Credit); formula error -> hold. See app/v2_billing.py.
+- Billed rows (billed_at set) are locked:
+    same text                     -> nothing
+    text edit, same billing mode  -> applied, logged as auto_applied
+    billing mode changes / cleared -> row untouched, pending DeliveryChange for an admin
+    a value an admin rejected     -> not flagged again
+    error cell (#REF! etc.)       -> ignored, reported as an issue
+- Payments tab (current month only) -> monthly_amounts, one amount per dog. The Dog
+  column may be blank only when the number has exactly one dog.
 - Dogs not present in the push are left alone (a deleted sheet row never wipes history).
 
 Customers come from the sheet too (the sheet is the source of truth for who is a customer):
@@ -46,7 +51,7 @@ from app.auth import get_current_user, hash_password
 from app.config import settings
 from app.database import get_db
 from app.models.user import User
-from app.models.v2 import Delivery, DeliveryChange, Dog, SyncRun
+from app.models.v2 import Delivery, DeliveryChange, Dog, MonthlyAmount, SyncRun
 
 router = APIRouter(prefix="/v2/schedule", tags=["v2 schedule"])
 
@@ -78,6 +83,9 @@ def today_ist() -> Date:
     return datetime.now(IST).date()
 
 
+BILLING_MODES = ("charge", "credit", "skip")
+
+
 @dataclass(frozen=True)
 class Cell:
     raw: str
@@ -85,7 +93,23 @@ class Cell:
     dish: Optional[str]
     keyword: Optional[str]
     reason: Optional[str]
-    billable: bool
+    billing: str              # charge | credit | skip | hold
+
+    @property
+    def billable(self) -> bool:
+        return self.billing == "charge"
+
+    def as_dict(self) -> dict:
+        return {"raw": self.raw, "kind": self.kind, "dish": self.dish, "keyword": self.keyword,
+                "reason": self.reason, "billing": self.billing}
+
+
+def keyword_mode(k) -> str:
+    """Keywords tab "Billing" column; old "Billable?" Yes = Charge; default Credit."""
+    mode = (k.billing or "").strip().lower()
+    if mode in BILLING_MODES:
+        return mode
+    return "charge" if k.billable else "credit"
 
 
 def classify(raw: str, keywords: dict) -> Optional[Cell]:
@@ -93,21 +117,22 @@ def classify(raw: str, keywords: dict) -> Optional[Cell]:
     if not v:
         return None
     if ERROR_CELL.match(v):
-        return Cell(v, "error", None, None, None, False)
+        return Cell(v, "error", None, None, None, "hold")
     k = keywords.get(v.upper())
     if k is not None:
-        return Cell(v, "keyword", None, v.upper(), (k.reason or "").strip() or None, k.billable)
-    return Cell(v, "meal", v, None, None, True)
+        return Cell(v, "keyword", None, v.upper(), (k.reason or "").strip() or None, keyword_mode(k))
+    return Cell(v, "meal", v, None, None, "charge")
 
 
 def apply_cell(d: Delivery, c: Cell) -> None:
-    d.raw_value, d.kind, d.dish, d.keyword, d.reason, d.billable = (
-        c.raw, c.kind, c.dish, c.keyword, c.reason, c.billable
+    d.raw_value, d.kind, d.dish, d.keyword, d.reason, d.billing = (
+        c.raw, c.kind, c.dish, c.keyword, c.reason, c.billing
     )
+    d.billable = c.billable
 
 
 def same(d: Delivery, c: Cell) -> bool:
-    return (d.raw_value, d.kind, d.reason, d.billable) == (c.raw, c.kind, c.reason, c.billable)
+    return (d.raw_value, d.kind, d.reason, d.billing) == (c.raw, c.kind, c.reason, c.billing)
 
 
 async def verified_body(request: Request) -> bytes:
@@ -135,7 +160,8 @@ async def verified_body(request: Request) -> bytes:
 class KeywordIn(BaseModel):
     keyword: str
     reason: Optional[str] = None
-    billable: bool = False
+    billable: bool = False            # legacy "Billable?" column
+    billing: Optional[str] = None     # "Billing" column: Charge | Credit | Skip
 
 
 class RowIn(BaseModel):
@@ -153,6 +179,14 @@ class MessageIn(BaseModel):
     wa_message_id: str = Field(max_length=200)
 
 
+class PaymentIn(BaseModel):
+    row: int
+    owner: str = ""
+    phone: str = ""
+    dog: str = ""                     # blank = the number's only dog
+    amount: Optional[float] = None    # monthly amount for this dog; blank = not set
+
+
 class SyncPayload(BaseModel):
     month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     sheet_tab: str
@@ -160,6 +194,7 @@ class SyncPayload(BaseModel):
     keywords: list[KeywordIn] = []
     rows: list[RowIn]
     messages: list[MessageIn] = []
+    payments: list[PaymentIn] = []    # only applied when `month` is the current IST month
 
 
 # ---------- sync ----------
@@ -191,7 +226,7 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     # -- match sheet rows to dogs: normalised WhatsApp number -> user, dog name -> dog.
     # Missing users/dogs are created (see module docstring). Two pushes racing to create
     # the same user hit the unique constraint, roll back whole, and the next push succeeds.
-    phones = {normalize_phone(x.phone) for x in [*p.rows, *p.messages]} - {None}
+    phones = {normalize_phone(x.phone) for x in [*p.rows, *p.messages, *p.payments]} - {None}
     user_by_phone: dict[str, int] = {}
     if phones:
         res = await db.execute(select(User.id, User.wa_phone).where(User.wa_phone.in_(phones)))
@@ -271,6 +306,7 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     # -- load what we already have for these dogs this month (locked against the billing job)
     existing: dict[tuple, Delivery] = {}
     pending: dict[int, DeliveryChange] = {}
+    rejected: dict[int, set] = {}   # delivery_id -> sheet values an admin already said no to
     dog_ids = [d.id for _, d in matched]
     if dog_ids:
         res = await db.execute(
@@ -279,14 +315,19 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
             .with_for_update()
         )
         existing = {(d.dog_id, d.delivery_date): d for d in res.scalars()}
-        locked_ids = [d.id for d in existing.values() if d.billed_ledger_id is not None]
+        locked_ids = [d.id for d in existing.values() if d.billed_at is not None]
         if locked_ids:
             res = await db.execute(
-                select(DeliveryChange).where(
-                    DeliveryChange.delivery_id.in_(locked_ids), DeliveryChange.status == "pending"
-                )
+                select(DeliveryChange)
+                .where(DeliveryChange.delivery_id.in_(locked_ids),
+                       DeliveryChange.status.in_(("pending", "rejected")))
+                .order_by(DeliveryChange.id)
             )
-            pending = {c.delivery_id: c for c in res.scalars()}
+            for c in res.scalars():
+                if c.status == "pending":
+                    pending[c.delivery_id] = c
+                else:
+                    rejected.setdefault(c.delivery_id, set()).add(c.new_raw)
 
     def withdraw(c: Optional[DeliveryChange]) -> None:
         if c is not None and c.status == "pending":
@@ -315,7 +356,7 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
             if cur.sheet_row != r.row:
                 cur.sheet_row = r.row
 
-            if cur.billed_ledger_id is None:                 # unlocked: mirror the sheet
+            if cur.billed_at is None:                        # unlocked: mirror the sheet
                 if cell is None:
                     await db.delete(cur)
                     stats["deleted"] += 1
@@ -333,27 +374,39 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
                 withdraw(open_change)
                 stats["unchanged"] += 1
                 continue
+            if new_raw in rejected.get(cur.id, ()):
+                withdraw(open_change)
+                stats["rejected_kept"] += 1
+                continue
             if cell is not None and cell.kind == "error":
                 issues.append({"row": r.row, "dog": r.dog, "date": day.isoformat(),
                                "issue": "error_on_billed_day", "level": "problem", "value": cell.raw})
                 continue
-            new_billable = cell.billable if cell else False
-            if cell is not None and new_billable == cur.billable:
+            new_billing = cell.billing if cell else "skip"
+            if cell is not None and new_billing == cur.billing:
                 db.add(DeliveryChange(delivery_id=cur.id, old_raw=cur.raw_value, new_raw=new_raw,
-                                      old_billable=cur.billable, new_billable=new_billable,
-                                      status="auto_applied", resolved_at=now))
+                                      old_billable=cur.billable, new_billable=cell.billable,
+                                      old_billing=cur.billing, new_billing=new_billing,
+                                      new_cell=cell.as_dict(), status="auto_applied", resolved_at=now))
                 withdraw(open_change)
                 apply_cell(cur, cell)
                 stats["auto_applied"] += 1
                 continue
+            snapshot = cell.as_dict() if cell else None
             if open_change is None:
                 db.add(DeliveryChange(delivery_id=cur.id, old_raw=cur.raw_value, new_raw=new_raw,
-                                      old_billable=cur.billable, new_billable=new_billable,
-                                      status="pending", last_seen_at=now))
+                                      old_billable=cur.billable, new_billable=new_billing == "charge",
+                                      old_billing=cur.billing, new_billing=new_billing,
+                                      new_cell=snapshot, status="pending", last_seen_at=now))
             else:
-                open_change.new_raw, open_change.new_billable = new_raw, new_billable
+                open_change.new_raw, open_change.new_billable = new_raw, new_billing == "charge"
+                open_change.new_billing, open_change.new_cell = new_billing, snapshot
                 open_change.last_seen_at = now
             stats["flagged"] += 1
+
+    # -- Payments tab -> monthly_amounts (current month only: the tab only ever holds this month)
+    if p.payments and p.month == today_ist().strftime("%Y-%m"):
+        await apply_payments(db, p, user_by_phone, dog_by_key, issues, stats)
 
     stats["rows_matched"] = len(matched)
     stats["rows_unmatched"] = len({x["row"] for x in issues
@@ -362,6 +415,62 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     db.add(SyncRun(month=p.month, sheet_tab=p.sheet_tab, stats=dict(stats), issues=issues))
     await db.commit()
     return {"ok": True, "month": p.month, "stats": dict(stats), "issues": issues}
+
+
+async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats) -> None:
+    def note(r, issue, level, **extra):
+        issues.append({"tab": "Payments", "row": r.row, "owner": r.owner, "dog": r.dog,
+                       "issue": issue, "level": level, **extra})
+
+    dogs_of: dict[int, list[Dog]] = {}
+    for (uid, _), d in dog_by_key.items():
+        if d.active:
+            dogs_of.setdefault(uid, []).append(d)
+
+    res = await db.execute(select(MonthlyAmount).where(
+        MonthlyAmount.month == p.month,
+        MonthlyAmount.dog_id.in_([d.id for d in dog_by_key.values()] or [0]),
+    ))
+    current = {m.dog_id: m for m in res.scalars()}
+    seen: dict[int, int] = {}
+
+    for r in p.payments:
+        if r.amount is None:
+            continue
+        pn = normalize_phone(r.phone)
+        uid = user_by_phone.get(pn) if pn else None
+        if uid is None:
+            note(r, "payments_unknown_number", "problem", phone=r.phone)
+            continue
+        if r.amount < 0:
+            note(r, "payments_negative_amount", "problem", amount=r.amount)
+            continue
+        if r.dog.strip():
+            dog = dog_by_key.get((uid, name_key(r.dog)))
+            if dog is None or not dog.active:
+                note(r, "payments_unknown_dog", "problem")
+                continue
+        else:
+            mine = dogs_of.get(uid, [])
+            if len(mine) != 1:
+                note(r, "payments_dog_required", "problem", dogs=len(mine))
+                continue
+            dog = mine[0]
+        if dog.id in seen:
+            note(r, "payments_duplicate", "problem", first_row=seen[dog.id])
+            continue
+        seen[dog.id] = r.row
+
+        amount = round(float(r.amount), 2)
+        m = current.get(dog.id)
+        if m is None:
+            db.add(MonthlyAmount(dog_id=dog.id, month=p.month, amount=amount, source_row=r.row))
+            stats["amounts_set"] += 1
+            note(r, "amount_set", "info", amount=amount, dog=dog.name)
+        elif float(m.amount) != amount:
+            note(r, "amount_changed", "info", old=float(m.amount), new=amount, dog=dog.name)
+            m.amount, m.source_row = amount, r.row
+            stats["amounts_changed"] += 1
 
 
 # ---------- app read ----------
@@ -395,7 +504,9 @@ async def my_schedule(
             "keyword": d.keyword,
             "reason": d.reason,
             "billable": d.billable,
-            "billed": d.billed_ledger_id is not None,
+            "billing": d.billing,
+            "billed": d.billed_at is not None,
+            "amount": float(d.amount) if d.amount is not None else None,
         }
         for d, dog_name in res.all()
     ]
