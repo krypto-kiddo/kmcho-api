@@ -18,7 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade():
-    # WhatsApp number in one canonical form: 12 digits, "91" + 10-digit mobile
+    # WhatsApp number, normalised exactly like the sender's normalisePhone_() (e.g. 919876543210)
     op.add_column("users", sa.Column("wa_phone", sa.String(15), nullable=True))
     op.create_unique_constraint("uq_users_wa_phone", "users", ["wa_phone"])
 
@@ -31,7 +31,8 @@ def upgrade():
                    CASE
                      WHEN length(d) = 10 THEN '91' || d
                      WHEN length(d) = 11 AND left(d, 1) = '0' THEN '91' || substr(d, 2)
-                     WHEN length(d) = 12 AND left(d, 2) = '91' THEN d
+                     WHEN length(d) BETWEEN 8 AND 15 AND length(d) <> 10
+                          AND NOT (length(d) = 11 AND left(d, 1) = '0') THEN d
                    END AS p
             FROM digits
         ), uniq AS (

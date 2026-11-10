@@ -46,14 +46,16 @@ ERROR_CELL = re.compile(r"^#(N/A|[A-Z0-9/]+[!?])$")  # #N/A #REF! #VALUE! #DIV/0
 # ---------- helpers ----------
 
 def normalize_phone(raw: str) -> Optional[str]:
+    """Same rules as normalisePhone_() in the WhatsApp sender:
+    10 digits -> 91 + number; 11 digits starting 0 -> 91 + rest; anything else
+    kept as-is (foreign numbers carry their own country code).
+    Only addition: fewer than 8 or more than 15 digits can't be a WhatsApp number -> None."""
     d = re.sub(r"\D", "", raw or "")
     if len(d) == 10:
         return "91" + d
     if len(d) == 11 and d.startswith("0"):
         return "91" + d[1:]
-    if len(d) == 12 and d.startswith("91"):
-        return d
-    return None
+    return d if 8 <= len(d) <= 15 else None
 
 
 def name_key(name: str) -> str:
@@ -166,7 +168,10 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     if bad:
         raise HTTPException(422, f"cells/dates length mismatch on rows {bad[:10]}")
 
-    keywords = {" ".join(k.keyword.split()).upper(): k for k in p.keywords if k.keyword.strip()}
+    # The sender only treats a Keywords row as a keyword when it also has a reason
+    # (otherwise it sends the cell as a dish), so do the same here.
+    keywords = {" ".join(k.keyword.split()).upper(): k
+                for k in p.keywords if k.keyword.strip() and (k.reason or "").strip()}
     issues: list[dict] = []
     stats: Counter = Counter()
     now = datetime.now(timezone.utc)

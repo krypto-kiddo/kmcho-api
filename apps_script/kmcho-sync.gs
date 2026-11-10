@@ -6,9 +6,11 @@
  *   1. Project Settings > Script properties: add KMCHO_SYNC_SECRET
  *      (same value as SHEET_SYNC_SECRET on Railway).
  *   2. Run installSyncTrigger() once (hourly push).
- *   3. At the end of the 9 AM send function add:   try { pushCurrentMonth(); } catch (e) { console.error(e); }
+ *   3. Nothing to add to the 9 AM sender: sendDailyMeals() already calls
+ *      pushCurrentMonth() at the end when this file is present.
  *   4. Optional: add a "Billable?" column to Keywords (Yes/No). Missing = not billable.
- *   5. Check SYNC.log below matches your Log tab, or set it to null.
+ *   5. Optional: Script property MONITOR_NUMBERS = comma-separated internal/test
+ *      numbers (e.g. "9876543210, 9123456789"). Those rows are never synced or billed.
  *
  * Results go to a "Sync log" tab (created on first run); unmatched rows are listed there.
  */
@@ -23,9 +25,10 @@ const SYNC = {
   keywordsTab: 'Keywords',
   syncLogTab: 'Sync log',
   syncLogMaxRows: 500,
-  // Where the sender logs WhatsApp message IDs (1-based columns). Set log: null to skip.
-  // Rows are matched by send time (IST date) + phone + dog; only ids starting "wamid" are sent.
-  log: { tab: 'Log', firstRow: 2, timestampCol: 1, phoneCol: 3, dogCol: 4, messageIdCol: 5 },
+  // Sender's Log tab: Time | Type | Owner | Dog | Number | Result | Message ID / error
+  // Only real daily sends are used (Type "MEAL" or "NOT DELIVERED (…)"); tests,
+  // payment reminders and failures are skipped. Set log: null to skip entirely.
+  log: { tab: 'Log', firstRow: 2, timestampCol: 1, typeCol: 2, dogCol: 4, phoneCol: 5, resultCol: 6, messageIdCol: 7 },
 };
 
 /** Hourly trigger + called after the 9 AM send. Also re-pushes last month on the 1st/2nd. */
@@ -71,11 +74,16 @@ function pushMonth(year, month) {
 
   // Display values = exactly what the kitchen sees (formulas resolved, errors as "#N/A").
   const grid = sh.getRange(SYNC.firstDataRow, 1, lastRow - SYNC.firstDataRow + 1, lastCol).getDisplayValues();
+  const monitors = monitorNumbers_();
   const rows = [];
+  let skippedMonitors = 0;
   grid.forEach((r, i) => {
     const dog = String(r[SYNC.cols.dog - 1]).trim();
     const phone = String(r[SYNC.cols.phone - 1]).trim();
     if (!dog && !phone) return;
+    // Same normalisation the WhatsApp sender uses, so phones match the Log tab.
+    const phoneNorm = normalisePhone_(phone);
+    if (monitors[phoneNorm]) { skippedMonitors++; return; }   // internal monitor rows: never billed
     rows.push({
       row: SYNC.firstDataRow + i,
       owner: String(r[SYNC.cols.owner - 1]).trim(),
@@ -91,7 +99,7 @@ function pushMonth(year, month) {
     dates: dates,
     keywords: readKeywords_(ss),
     rows: rows,
-    messages: readMessageIds_(ss, dates),
+    messages: readMessageIds_(ss, dates, monitors),
   };
   const res = post_(payload);
   writeSyncLog_(tab, res.code, res.stats, res.issues);
@@ -102,7 +110,8 @@ function readKeywords_(ss) {
   if (!sh || sh.getLastRow() < 2) return [];
   const v = sh.getDataRange().getDisplayValues();
   const h = v[0].map(x => String(x).trim().toLowerCase());
-  const kCol = h.indexOf('keyword'), rCol = h.indexOf('reason');
+  // Our Keywords header is 'Reason (finishes: "…because ___")', so match by prefix.
+  const kCol = h.indexOf('keyword'), rCol = h.findIndex(x => x.indexOf('reason') === 0);
   const bCol = h.findIndex(x => x.replace('?', '') === 'billable');
   if (kCol === -1) return [];
   return v.slice(1)
@@ -114,7 +123,7 @@ function readKeywords_(ss) {
     }));
 }
 
-function readMessageIds_(ss, dates) {
+function readMessageIds_(ss, dates, monitors) {
   if (!SYNC.log) return [];
   const sh = ss.getSheetByName(SYNC.log.tab);
   if (!sh || sh.getLastRow() < SYNC.log.firstRow) return [];
@@ -128,11 +137,23 @@ function readMessageIds_(ss, dates) {
     if (!(ts instanceof Date)) return;
     const date = Utilities.formatDate(ts, SYNC.tz, 'yyyy-MM-dd');
     if (!want[date]) return;
+    const type = String(r[L.typeCol - 1]).trim();
+    if (type !== 'MEAL' && type.indexOf('NOT DELIVERED') !== 0) return;  // skips tests "(test)", reminders, photo/logo rows
+    if (String(r[L.resultCol - 1]).trim() !== 'SENT') return;
     const id = String(r[L.messageIdCol - 1]).trim();
     const dog = String(r[L.dogCol - 1]).trim();
-    if (id.indexOf('wamid') !== 0 || !dog) return;   // skips failures and payment reminders
-    out.push({ phone: String(r[L.phoneCol - 1]).trim(), dog: dog, date: date, wa_message_id: id });
+    const phone = String(r[L.phoneCol - 1]).trim();   // already normalised by the sender, e.g. 919876543210
+    if (id.indexOf('wamid') !== 0 || !dog || dog === '-' || monitors[phone]) return;
+    out.push({ phone: phone, dog: dog, date: date, wa_message_id: id });
   });
+  return out;
+}
+
+// MONITOR_NUMBERS script property -> { "919876543210": true, … }
+function monitorNumbers_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('MONITOR_NUMBERS') || '';
+  const out = {};
+  raw.split(/[,;\n]/).map(x => normalisePhone_(x)).filter(Boolean).forEach(p => out[p] = true);
   return out;
 }
 
