@@ -2,8 +2,9 @@
 
 The kitchen's Google Sheet is the source of truth for what is delivered each
 day. Apps Script pushes the month grid to POST /v2/schedule/sync, which keeps
-`deliveries` in step with it. Money never lives here: billing writes ledger
-entries and links them back via `deliveries.billed_ledger_id`.
+`deliveries` in step with it, and the Payments tab into `monthly_amounts`.
+Money only moves through v1's orders + ledger: billing (app/v2_billing.py) writes
+an order + ledger debit per delivered meal and links them back on the delivery.
 """
 from typing import Optional
 
@@ -28,9 +29,6 @@ class Dog(Base):
     # casefolded, whitespace-collapsed name; what the sheet's "Dog" column is matched on
     name_key: Mapped[str] = mapped_column(String, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    # fixed monthly rate for this dog. NULL = never billed: the sheet sync creates dogs
-    # with no rate, and billing must skip them until an admin sets one.
-    monthly_rate: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
@@ -50,10 +48,17 @@ class Delivery(Base):
     dish: Mapped[Optional[str]] = mapped_column(Text, nullable=True)      # kind=meal
     keyword: Mapped[Optional[str]] = mapped_column(String, nullable=True) # kind=keyword, e.g. PAUSE
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)    # Keywords tab "Reason"
-    billable: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    billable: Mapped[bool] = mapped_column(Boolean, nullable=False)       # billing == "charge"
+    # charge: delivered meal, billed its share | credit: counted slot, share stays in balance (PAUSE)
+    # skip: not a slot, month spread over the rest (HOLIDAY) | hold: formula error, never auto-billed
+    billing: Mapped[str] = mapped_column(String(8), nullable=False)
 
     wa_message_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    # set by the billing job; a non-null value locks the row against sheet edits
+    # Set by billing. billed_at != NULL locks the row against sheet edits.
+    # amount = this slot's share (charged for charge, kept as credit for credit).
+    billed_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    amount: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
+    order_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"), nullable=True)
     billed_ledger_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ledger.id"), nullable=True)
 
     sheet_tab: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -68,11 +73,11 @@ class DeliveryChange(Base):
     """A sheet edit to an already-billed day.
 
     status:
-      pending       billable-ness changed; row untouched until an admin decides
-      approved      admin accepted; ledger_id points at the refund/adjustment
-      rejected      admin kept the original
+      pending       billing mode changed / cell cleared; row untouched until an admin decides
+      approved      admin accepted; ledger_id points at the refund/adjustment (if money moved)
+      rejected      admin kept the original; the same sheet value is not flagged again
       withdrawn     sheet went back to the original value before anyone decided
-      auto_applied  text-only edit (same billable-ness); applied, kept for audit
+      auto_applied  text-only edit (same billing mode); applied, kept for audit
     """
     __tablename__ = "delivery_changes"
 
@@ -82,6 +87,9 @@ class DeliveryChange(Base):
     new_raw: Mapped[str] = mapped_column(Text, nullable=False)  # "" = cell cleared
     old_billable: Mapped[bool] = mapped_column(Boolean, nullable=False)
     new_billable: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    old_billing: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    new_billing: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    new_cell: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)  # classified new value
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
     ledger_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ledger.id"), nullable=True)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -91,6 +99,19 @@ class DeliveryChange(Base):
     resolved_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     delivery = relationship("Delivery")
+
+
+class MonthlyAmount(Base):
+    """What one dog costs for one month, from the sheet's Payments tab."""
+    __tablename__ = "monthly_amounts"
+    __table_args__ = (UniqueConstraint("dog_id", "month", name="uq_monthly_amounts_dog_month"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dog_id: Mapped[int] = mapped_column(ForeignKey("dogs.id"), nullable=False)
+    month: Mapped[str] = mapped_column(String(7), nullable=False)  # YYYY-MM
+    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    source_row: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class SyncRun(Base):
