@@ -1,6 +1,8 @@
 """v2 login: WhatsApp number + password (interim, until WhatsApp OTP is approved).
 
 POST /v2/auth/login                          {phone, password, remember_me} -> same JWT as v1 /auth/login
+                                             + role ("admin" | "customer") so the app can route.
+                                             One endpoint for both, like v1. Admins need users.wa_phone.
 POST /v2/admin/users/{user_id}/temp-password  admin: one-time password to hand a customer
 
 Flow for customers the sheet sync created (they have no usable password):
@@ -72,7 +74,9 @@ async def login_with_phone(p: PhoneLogin, db: AsyncSession = Depends(get_db)):
 
     expires = timedelta(days=30) if p.remember_me else timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token({"sub": str(user.id)}, expires_delta=expires)
-    return {"access_token": token, "token_type": "bearer", "must_set_password": not user.is_onboarded}
+    return {"access_token": token, "token_type": "bearer",
+            "role": "admin" if user.is_admin else "customer",   # route like v1 does
+            "must_set_password": not user.is_onboarded}
 
 
 @router.post("/v2/admin/users/{user_id}/temp-password")

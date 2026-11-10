@@ -29,6 +29,8 @@ Customers come from the sheet too (the sheet is the source of truth for who is a
 - Every created user/dog is reported in `issues` (level "info") so it shows in the Sync log.
 - Rows without a usable number, dog or (for a new customer) owner are reported, not created.
 - A dog an admin deactivated is not recreated; its row is reported as dog_inactive.
+- Admin accounts are never matched: a row (or Payments row) with an admin's number is
+  skipped and reported as admin_number. Admins log in by number, so their wa_phone is set.
 """
 import secrets
 import hashlib
@@ -228,9 +230,14 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     # the same user hit the unique constraint, roll back whole, and the next push succeeds.
     phones = {normalize_phone(x.phone) for x in [*p.rows, *p.messages, *p.payments]} - {None}
     user_by_phone: dict[str, int] = {}
+    admin_phones: set[str] = set()  # admins log in by number too; their rows are never synced
     if phones:
-        res = await db.execute(select(User.id, User.wa_phone).where(User.wa_phone.in_(phones)))
-        user_by_phone = {wa: uid for uid, wa in res.all()}
+        res = await db.execute(select(User.id, User.wa_phone, User.is_admin).where(User.wa_phone.in_(phones)))
+        for uid, wa, is_admin in res.all():
+            if is_admin:
+                admin_phones.add(wa)      # never matched, created over, or billed
+            else:
+                user_by_phone[wa] = uid
     dog_by_key: dict[tuple, Dog] = {}  # includes inactive dogs, so they're never recreated
     if user_by_phone:
         res = await db.execute(select(Dog).where(Dog.user_id.in_(user_by_phone.values())))
@@ -257,6 +264,9 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
             problem(r, "missing_dog")
             continue
 
+        if pn in admin_phones:
+            problem(r, "admin_number")    # use a separate customer number, or add it to MONITOR_NUMBERS
+            continue
         uid = user_by_phone.get(pn)
         if uid is None:
             if not owner:
@@ -406,18 +416,19 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
 
     # -- Payments tab -> monthly_amounts (current month only: the tab only ever holds this month)
     if p.payments and p.month == today_ist().strftime("%Y-%m"):
-        await apply_payments(db, p, user_by_phone, dog_by_key, issues, stats)
+        await apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_phones)
 
     stats["rows_matched"] = len(matched)
     stats["rows_unmatched"] = len({x["row"] for x in issues
-                                   if x["issue"] in ("bad_number", "missing_dog", "missing_owner",
+                                   if x.get("tab") is None and x["issue"] in (
+                                                     "bad_number", "missing_dog", "missing_owner", "admin_number",
                                                      "dog_inactive", "duplicate_row")})
     db.add(SyncRun(month=p.month, sheet_tab=p.sheet_tab, stats=dict(stats), issues=issues))
     await db.commit()
     return {"ok": True, "month": p.month, "stats": dict(stats), "issues": issues}
 
 
-async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats) -> None:
+async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_phones=frozenset()) -> None:
     def note(r, issue, level, **extra):
         issues.append({"tab": "Payments", "row": r.row, "owner": r.owner, "dog": r.dog,
                        "issue": issue, "level": level, **extra})
@@ -438,6 +449,9 @@ async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats) -> Non
         if r.amount is None:
             continue
         pn = normalize_phone(r.phone)
+        if pn in admin_phones:
+            note(r, "admin_number", "problem")
+            continue
         uid = user_by_phone.get(pn) if pn else None
         if uid is None:
             note(r, "payments_unknown_number", "problem", phone=r.phone)
