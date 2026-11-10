@@ -179,7 +179,8 @@ function post_(payload) {
   return {
     code: code,
     stats: JSON.stringify(json.stats),
-    issues: json.issues.map(i => 'row ' + i.row + ' ' + (i.dog || '') + (i.date ? ' ' + i.date : '') + ': ' + i.issue).join('\n'),
+    // "NEW" lines are users/dogs the sync just created (check them once); the rest need fixing.
+    issues: json.issues.map(i => (i.level === 'info' ? 'NEW ' : '') + 'row ' + i.row + ' ' + (i.owner ? i.owner + ' / ' : '') + (i.dog || '') + (i.date ? ' ' + i.date : '') + ': ' + i.issue).join('\n'),
   };
 }
 

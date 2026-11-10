@@ -28,7 +28,8 @@ class Dog(Base):
     # casefolded, whitespace-collapsed name; what the sheet's "Dog" column is matched on
     name_key: Mapped[str] = mapped_column(String, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    # fixed monthly rate for this dog; NULL until billing is set up for them
+    # fixed monthly rate for this dog. NULL = never billed: the sheet sync creates dogs
+    # with no rate, and billing must skip them until an admin sets one.
     monthly_rate: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

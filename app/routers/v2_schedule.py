@@ -12,8 +12,20 @@ Sync rules
     billable flips / cleared  -> row untouched, pending DeliveryChange for an admin
     error cell (#REF! etc.)   -> ignored, reported as an issue
 - Dogs not present in the push are left alone (a deleted sheet row never wipes history).
-- Rows that can't be matched to a dog are reported back, never auto-created.
+
+Customers come from the sheet too (the sheet is the source of truth for who is a customer):
+- A row's WhatsApp number is the customer's identity. Names are labels only.
+- Unknown number -> a user is created (name = Owner column, no email, unusable password,
+  so v1 login is impossible; v2 login is meant to be OTP on this number).
+- Unknown dog for a known number -> a dog is created, with NO monthly_rate. Billing must
+  skip dogs without a rate, so a sheet typo can create a stray user/dog but never a charge.
+- Nothing is ever deleted, renamed or deactivated by the sync. Existing users.name is
+  never overwritten by the sheet.
+- Every created user/dog is reported in `issues` (level "info") so it shows in the Sync log.
+- Rows without a usable number, dog or (for a new customer) owner are reported, not created.
+- A dog an admin deactivated is not recreated; its row is reported as dog_inactive.
 """
+import secrets
 import hashlib
 import hmac
 import json
@@ -30,7 +42,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
+from app.auth import get_current_user, hash_password
 from app.config import settings
 from app.database import get_db
 from app.models.user import User
@@ -176,47 +188,84 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     stats: Counter = Counter()
     now = datetime.now(timezone.utc)
 
-    # -- match sheet rows to dogs: normalised WhatsApp number -> user, dog name -> dog
+    # -- match sheet rows to dogs: normalised WhatsApp number -> user, dog name -> dog.
+    # Missing users/dogs are created (see module docstring). Two pushes racing to create
+    # the same user hit the unique constraint, roll back whole, and the next push succeeds.
     phones = {normalize_phone(x.phone) for x in [*p.rows, *p.messages]} - {None}
     user_by_phone: dict[str, int] = {}
     if phones:
         res = await db.execute(select(User.id, User.wa_phone).where(User.wa_phone.in_(phones)))
         user_by_phone = {wa: uid for uid, wa in res.all()}
-    dog_by_key: dict[tuple, Dog] = {}
+    dog_by_key: dict[tuple, Dog] = {}  # includes inactive dogs, so they're never recreated
     if user_by_phone:
-        res = await db.execute(
-            select(Dog).where(Dog.user_id.in_(user_by_phone.values()), Dog.active.is_(True))
-        )
+        res = await db.execute(select(Dog).where(Dog.user_id.in_(user_by_phone.values())))
         dog_by_key = {(d.user_id, d.name_key): d for d in res.scalars()}
 
-    def resolve(phone: str, dog: str) -> tuple[Optional[Dog], Optional[str]]:
-        pn = normalize_phone(phone)
-        if not pn:
-            return None, "bad_number"
-        uid = user_by_phone.get(pn)
-        if uid is None:
-            return None, "unknown_number"
-        d = dog_by_key.get((uid, name_key(dog)))
-        return (d, None) if d else (None, "unknown_dog")
+    def problem(r: RowIn, issue: str, **extra) -> None:
+        issues.append({"row": r.row, "owner": r.owner, "dog": r.dog, "phone": r.phone,
+                       "issue": issue, "level": "problem", **extra})
+
+    def info(r: RowIn, issue: str, **extra) -> None:
+        issues.append({"row": r.row, "owner": r.owner, "dog": r.dog, "issue": issue,
+                       "level": "info", **extra})
 
     matched: list[tuple[RowIn, Dog]] = []
     first_row_for: dict[int, int] = {}
     for r in p.rows:
-        dog, err = resolve(r.phone, r.dog)
-        if err:
-            issues.append({"row": r.row, "owner": r.owner, "dog": r.dog, "phone": r.phone, "issue": err})
+        pn = normalize_phone(r.phone)
+        dog_name = " ".join(r.dog.split())
+        owner = " ".join(r.owner.split())
+        if not pn:
+            problem(r, "bad_number")
             continue
+        if not dog_name:
+            problem(r, "missing_dog")
+            continue
+
+        uid = user_by_phone.get(pn)
+        if uid is None:
+            if not owner:
+                problem(r, "missing_owner")
+                continue
+            user = User(
+                name=owner,
+                phone=" ".join(r.phone.split()),
+                wa_phone=pn,
+                password_hash=hash_password(secrets.token_urlsafe(32)),  # nobody knows it
+                is_admin=False,
+                is_onboarded=False,
+                current_balance=0,
+            )
+            db.add(user)
+            await db.flush()
+            uid = user_by_phone[pn] = user.id
+            stats["created_users"] += 1
+            info(r, "created_user", wa_phone=pn)
+
+        key = (uid, name_key(dog_name))
+        dog = dog_by_key.get(key)
+        if dog is None:
+            dog = Dog(user_id=uid, name=dog_name, name_key=key[1], active=True)
+            db.add(dog)
+            await db.flush()
+            dog_by_key[key] = dog
+            stats["created_dogs"] += 1
+            info(r, "created_dog")
+        elif not dog.active:
+            problem(r, "dog_inactive")
+            continue
+
         if dog.id in first_row_for:
-            issues.append({"row": r.row, "dog": r.dog, "issue": "duplicate_row",
-                           "first_row": first_row_for[dog.id]})
+            problem(r, "duplicate_row", first_row=first_row_for[dog.id])
             continue
         first_row_for[dog.id] = r.row
         matched.append((r, dog))
 
     wa_ids: dict[tuple, str] = {}
     for msg in p.messages:
-        dog, _ = resolve(msg.phone, msg.dog)
-        if dog and first <= msg.date <= last:
+        pn = normalize_phone(msg.phone)
+        dog = dog_by_key.get((user_by_phone.get(pn), name_key(msg.dog))) if pn else None
+        if dog and dog.active and first <= msg.date <= last:
             wa_ids[(dog.id, msg.date)] = msg.wa_message_id
 
     # -- load what we already have for these dogs this month (locked against the billing job)
@@ -286,7 +335,7 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
                 continue
             if cell is not None and cell.kind == "error":
                 issues.append({"row": r.row, "dog": r.dog, "date": day.isoformat(),
-                               "issue": "error_on_billed_day", "value": cell.raw})
+                               "issue": "error_on_billed_day", "level": "problem", "value": cell.raw})
                 continue
             new_billable = cell.billable if cell else False
             if cell is not None and new_billable == cur.billable:
@@ -307,7 +356,9 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
             stats["flagged"] += 1
 
     stats["rows_matched"] = len(matched)
-    stats["rows_unmatched"] = sum(1 for x in issues if x["issue"] in ("bad_number", "unknown_number", "unknown_dog"))
+    stats["rows_unmatched"] = len({x["row"] for x in issues
+                                   if x["issue"] in ("bad_number", "missing_dog", "missing_owner",
+                                                     "dog_inactive", "duplicate_row")})
     db.add(SyncRun(month=p.month, sheet_tab=p.sheet_tab, stats=dict(stats), issues=issues))
     await db.commit()
     return {"ok": True, "month": p.month, "stats": dict(stats), "issues": issues}
