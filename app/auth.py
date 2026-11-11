@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -27,7 +27,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.JWT_SECRET, algorithm="HS256")
 
+# Methods that only read. A read-only token (admin "view as customer") may use nothing else.
+READ_ONLY_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
 async def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db)
 ) -> User:
@@ -41,8 +46,13 @@ async def get_current_user(
         user_id = int(payload.get("sub"))
         if user_id is None:
             raise credentials_exception
-    except JWTError:
+    except (JWTError, TypeError, ValueError):
         raise credentials_exception
+
+    # Admin "view as customer" tokens carry ro=True: they can look, never change anything.
+    if payload.get("ro") and request.method not in READ_ONLY_METHODS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Viewing as a customer is read-only.")
+    request.state.view_by = payload.get("view_by")
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()

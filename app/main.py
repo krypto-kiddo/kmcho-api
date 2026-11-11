@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from app.routers import users, orders, ledger, auth, profile, invoice, subscriptions, v2_schedule, v2_billing, v2_auth, v2_otp
+from app.routers import users, orders, ledger, auth, profile, invoice, subscriptions, v2_schedule, v2_billing, v2_auth, v2_otp, v2_me
 
 
 
@@ -26,6 +26,8 @@ app.add_middleware(
         "https://my.kmcho.co.in",
         "https://kmcho-web.vercel.app",
         "https://chef.kmcho.co.in",
+        "https://v2.kmcho.co.in",           # v2 customer app (kmcho-web-v2)
+        "https://kmcho-web-v2.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -43,6 +45,7 @@ app.include_router(v2_schedule.router)
 app.include_router(v2_billing.router)
 app.include_router(v2_auth.router)
 app.include_router(v2_otp.router)
+app.include_router(v2_me.router)
 
 @app.get("/")
 async def root():
