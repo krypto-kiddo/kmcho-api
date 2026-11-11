@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from app.routers import users, orders, ledger, auth, profile, invoice, subscriptions, v2_schedule, v2_billing, v2_auth
+from app.routers import users, orders, ledger, auth, profile, invoice, subscriptions, v2_schedule, v2_billing, v2_auth, v2_otp
 
 
 
@@ -42,6 +42,7 @@ app.include_router(subscriptions.router)
 app.include_router(v2_schedule.router)
 app.include_router(v2_billing.router)
 app.include_router(v2_auth.router)
+app.include_router(v2_otp.router)
 
 @app.get("/")
 async def root():

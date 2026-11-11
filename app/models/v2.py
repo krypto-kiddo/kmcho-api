@@ -124,3 +124,19 @@ class SyncRun(Base):
     stats: Mapped[dict] = mapped_column(JSONB, nullable=False)
     issues: Mapped[list] = mapped_column(JSONB, nullable=False)
     received_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OtpCode(Base):
+    """One WhatsApp login code. Only its keyed hash is stored."""
+    __tablename__ = "otp_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    wa_phone: Mapped[str] = mapped_column(String(15), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="sent")  # sent|failed|used|dead|replaced
+    wa_message_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
