@@ -16,6 +16,10 @@ Sync rules
     error cell (#REF! etc.)       -> ignored, reported as an issue
 - Payments tab (current month only) -> monthly_amounts, one amount per dog. The Dog
   column may be blank only when the number has exactly one dog.
+- Payments "Previous dues" (current month only) -> opening_balances, summed per number,
+  until an admin applies it (app/v2_opening.py); then frozen.
+- Received tab (current month pushes) -> payments_received. Unposted rows follow the sheet;
+  rows already posted to the ledger are never removed (a missing one is reported).
 - Dogs not present in the push are left alone (a deleted sheet row never wipes history).
 
 Customers come from the sheet too (the sheet is the source of truth for who is a customer):
@@ -42,6 +46,7 @@ from calendar import monthrange
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date as Date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -53,7 +58,9 @@ from app.auth import get_current_user, hash_password
 from app.config import settings
 from app.database import get_db
 from app.models.user import User
-from app.models.v2 import Delivery, DeliveryChange, Dog, MonthlyAmount, SyncRun
+from app.models.v2 import (
+    Delivery, DeliveryChange, Dog, MonthlyAmount, OpeningBalance, PaymentReceived, SyncRun,
+)
 
 router = APIRouter(prefix="/v2/schedule", tags=["v2 schedule"])
 
@@ -187,6 +194,17 @@ class PaymentIn(BaseModel):
     phone: str = ""
     dog: str = ""                     # blank = the number's only dog
     amount: Optional[float] = None    # monthly amount for this dog; blank = not set
+    previous_dues: Optional[float] = None  # owed before this month (+) or advance (-); per number
+
+
+class ReceivedIn(BaseModel):
+    """One row of the Received tab: a payment the kitchen got."""
+    row: int
+    phone: str = ""
+    date: str = ""                    # yyyy-mm-dd from the script; anything else is reported
+    amount: Optional[float] = None
+    mode: str = Field("", max_length=40)
+    reference: str = Field("", max_length=120)
 
 
 class SyncPayload(BaseModel):
@@ -197,6 +215,8 @@ class SyncPayload(BaseModel):
     rows: list[RowIn]
     messages: list[MessageIn] = []
     payments: list[PaymentIn] = []    # only applied when `month` is the current IST month
+    dues_column: bool = False         # Payments tab has a "Previous dues" column
+    received: Optional[list[ReceivedIn]] = None  # Received tab; None = tab not sent
 
 
 # ---------- sync ----------
@@ -417,6 +437,10 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     # -- Payments tab -> monthly_amounts (current month only: the tab only ever holds this month)
     if p.payments and p.month == today_ist().strftime("%Y-%m"):
         await apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_phones)
+        if p.dues_column:
+            await apply_dues(db, p, user_by_phone, issues, stats, admin_phones)
+    if p.received is not None and p.month == today_ist().strftime("%Y-%m"):
+        await apply_received(db, p.received, user_by_phone, issues, stats, admin_phones)
 
     stats["rows_matched"] = len(matched)
     stats["rows_unmatched"] = len({x["row"] for x in issues
@@ -485,6 +509,112 @@ async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_
             note(r, "amount_changed", "info", old=float(m.amount), new=amount, dog=dog.name)
             m.amount, m.source_row = amount, r.row
             stats["amounts_changed"] += 1
+
+
+async def apply_dues(db, p, user_by_phone, issues, stats, admin_phones=frozenset()) -> None:
+    """Payments "Previous dues" -> opening_balances, summed per number. Frozen once applied."""
+    def note(r, issue, level, **extra):
+        issues.append({"tab": "Payments", "row": r.row, "owner": r.owner, "dog": r.dog,
+                       "issue": issue, "level": level, **extra})
+
+    sums: dict[int, Decimal] = {}
+    rows_of: dict[int, list[int]] = {}
+    owner_of: dict[int, str] = {}
+    for r in p.payments:
+        if r.previous_dues is None:
+            continue
+        pn = normalize_phone(r.phone)
+        if pn in admin_phones:
+            continue  # already reported by apply_payments
+        uid = user_by_phone.get(pn) if pn else None
+        if uid is None:
+            if r.amount is None:  # apply_payments didn't report this row
+                note(r, "payments_unknown_number", "problem", phone=r.phone)
+            continue
+        sums[uid] = sums.get(uid, Decimal("0")) + Decimal(str(r.previous_dues))
+        rows_of.setdefault(uid, []).append(r.row)
+        owner_of.setdefault(uid, r.owner)
+
+    existing = {o.user_id: o for o in (await db.execute(select(OpeningBalance))).scalars()}
+    first_row = {uid: rows[0] for uid, rows in rows_of.items()}
+    for uid in set(sums) | {u for u, o in existing.items() if o.applied_at is None}:
+        dues = sums.get(uid, Decimal("0")).quantize(Decimal("0.01"))
+        o = existing.get(uid)
+        where = {"tab": "Payments", "row": first_row.get(uid, 0), "owner": owner_of.get(uid, ""),
+                 "dog": "previous dues", "level": "info"}
+        if o is None:
+            if dues == 0:
+                continue
+            db.add(OpeningBalance(user_id=uid, month=p.month, dues=dues,
+                                  source_rows=",".join(map(str, rows_of.get(uid, [])))))
+            issues.append({**where, "issue": "dues_set", "amount": float(dues)})
+            stats["dues_set"] += 1
+        elif o.applied_at is not None:
+            if Decimal(o.dues) != dues:
+                issues.append({**where, "issue": "dues_ignored_opening_applied", "amount": float(dues)})
+        elif Decimal(o.dues) != dues:
+            issues.append({**where, "issue": "dues_changed", "old": float(o.dues), "new": float(dues)})
+            o.dues, o.month = dues, p.month
+            o.source_rows = ",".join(map(str, rows_of.get(uid, []))) or None
+            stats["dues_changed"] += 1
+
+
+async def apply_received(db, received, user_by_phone, issues, stats, admin_phones=frozenset()) -> None:
+    """Received tab -> payments_received. Unposted rows follow the sheet; posted rows are kept."""
+    def note(r, issue, level, **extra):
+        issues.append({"tab": "Received", "row": r.row, "owner": "", "dog": "",
+                       "issue": issue, "level": level, **extra})
+
+    today = today_ist()
+    wanted: dict[str, tuple[ReceivedIn, int, Date]] = {}
+    seen: Counter = Counter()
+    for r in received:
+        pn = normalize_phone(r.phone)
+        if not pn:
+            note(r, "bad_number", "problem")
+            continue
+        if pn in admin_phones:
+            note(r, "admin_number", "problem")
+            continue
+        uid = user_by_phone.get(pn)
+        if uid is None:
+            note(r, "received_unknown_number", "problem", phone=r.phone)
+            continue
+        try:
+            paid_on = Date.fromisoformat(r.date.strip())
+        except ValueError:
+            paid_on = None
+        if paid_on is None or paid_on > today:
+            note(r, "received_bad_date", "problem")
+            continue
+        if r.amount is None or r.amount <= 0:
+            note(r, "received_bad_amount", "problem")
+            continue
+        amount = Decimal(str(r.amount)).quantize(Decimal("0.01"))
+        base = f"{pn}|{paid_on.isoformat()}|{amount}|{' '.join(r.reference.split())}"
+        seen[base] += 1  # two identical payments on one day stay two rows
+        wanted[f"{base}|{seen[base]}"[:200]] = (r, uid, paid_on)
+
+    have = {x.sheet_key: x for x in (await db.execute(select(PaymentReceived))).scalars()}
+    for key, (r, uid, paid_on) in wanted.items():
+        if key in have:
+            continue
+        db.add(PaymentReceived(user_id=uid, paid_on=paid_on, amount=Decimal(str(r.amount)),
+                               mode=" ".join(r.mode.split()) or None,
+                               reference=" ".join(r.reference.split()) or None,
+                               sheet_key=key, source_row=r.row))
+        note(r, "received_added", "info", amount=float(r.amount))
+        stats["received_added"] += 1
+    for key, x in have.items():
+        if key in wanted:
+            continue
+        if x.posted_at is None:
+            await db.delete(x)
+            stats["received_removed"] += 1
+        else:
+            issues.append({"tab": "Received", "row": x.source_row or 0, "owner": "", "dog": "",
+                           "issue": "received_posted_row_missing", "level": "problem",
+                           "amount": float(x.amount), "date": x.paid_on.isoformat()})
 
 
 # ---------- app read ----------

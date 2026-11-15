@@ -6,7 +6,9 @@ GET  /v2/admin/billing/review             Admin: what needs a human this month.
 POST /v2/admin/billing/bill               Admin: bill specific older days.
 POST /v2/admin/changes/{id}/approve       Admin: accept a sheet edit to a billed day (moves money).
 POST /v2/admin/changes/{id}/reject        Admin: keep the billed value.
+POST /v2/admin/opening                    Admin: start customers' money in v2 (app/v2_opening.py).
 """
+import logging
 from datetime import date as Date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -21,11 +23,13 @@ from app.database import get_db
 from app.models.user import User
 from app.models.v2 import Delivery, DeliveryChange, Dog, MonthlyAmount
 from app.routers.v2_schedule import verified_body
+from app.v2_opening import run_opening
 from app.v2_billing import (
     SLOT_MODES, approve_change, bill_day, bill_selected, month_of, today_ist,
 )
 
 router = APIRouter(tags=["v2 billing"])
+log = logging.getLogger("kmcho.v2")
 
 
 class RunIn(BaseModel):
@@ -178,3 +182,20 @@ async def reject(change_id: int, p: DecisionIn = DecisionIn(), db: AsyncSession 
     c.resolved_at, c.resolved_by = datetime.now(timezone.utc), admin.id
     await db.commit()
     return {"change_id": c.id, "status": "rejected"}
+
+
+class OpeningIn(BaseModel):
+    dry_run: bool = True
+    user_ids: Optional[list[int]] = Field(None, max_length=500)
+
+
+@router.post("/v2/admin/opening")
+async def opening(p: OpeningIn, db: AsyncSession = Depends(get_db), admin: User = Depends(get_current_admin)):
+    """dry_run true (default): the full result, then everything rolled back."""
+    result = await run_opening(db, admin.id, p.user_ids)
+    if p.dry_run:
+        await db.rollback()
+    else:
+        await db.commit()
+        log.warning("v2 opening applied by admin %s: %s", admin.id, result["totals"])
+    return {"dry_run": p.dry_run, **result}

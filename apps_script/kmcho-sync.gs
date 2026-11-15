@@ -13,8 +13,14 @@
  *        Skip    not a delivery day; the month is spread over the other days (HOLIDAY)
  *        Charge  billed like a meal
  *      Blank = Credit.
- *   4b. Payments tab: add a "Dog" column (after Send reminder). Amount = that dog's
- *      monthly amount. Dog may be blank only when the number has a single dog.
+ *   4b. Payments tab: add a "Dog" column (after Send reminder). Dog may be blank only
+ *      when the number has a single dog. Then, at the END (the sender reads A-D by position):
+ *        Monthly amount   this month's cost for this dog. Billing reads only this.
+ *        Previous dues    owed before this month (+), advance (-), blank = 0. A formula
+ *                         like =8000+8000 is fine. Per number: put it on one row only.
+ *      and make "Amount due (₹)" =Monthly amount + Previous dues, for the reminders.
+ *   4c. Received tab: WhatsApp number | Date | Amount | Mode | Reference, one row per
+ *      payment received. Posted to customers' balances by an admin (POST /v2/admin/opening).
  *   5. Optional: Script property MONITOR_NUMBERS = comma-separated internal/test
  *      numbers (e.g. "9876543210, 9123456789"). Those rows are never synced or billed.
  *
@@ -26,6 +32,7 @@ const SYNC = {
   billingUrl: 'https://api.kmcho.co.in/v2/billing/run',
   billingHour: 21,       // IST; bills today's deliveries once the day's deliveries are done
   paymentsTab: 'Payments',
+  receivedTab: 'Received',
   tz: 'Asia/Kolkata',
   headerRow: 1,          // row holding the real dates
   firstDataRow: 2,
@@ -135,40 +142,87 @@ function pushMonth(year, month, withPayments) {
     keywords: readKeywords_(ss),
     rows: rows,
     messages: readMessageIds_(ss, dates, monitors),
-    payments: withPayments ? readPayments_(ss, monitors) : [],
   };
+  if (withPayments) {
+    const pay = readPayments_(ss, monitors);
+    payload.payments = pay.rows;
+    payload.dues_column = pay.duesColumn;
+    const received = readReceived_(ss, monitors);
+    if (received) payload.received = received;
+  }
   const res = post_(payload, SYNC.url);
   if (res.code !== 200) { writeSyncLog_(tab, res.code, res.text.slice(0, 2000), ''); return false; }
   writeSyncLog_(tab, res.code, JSON.stringify(res.json.stats), formatIssues_(res.json.issues));
   return true;
 }
 
-// Payments: Owner | WhatsApp number | Amount due (₹) | Send reminder | Dog  (found by header)
+// Payments: Owner | WhatsApp number | Amount due (₹) | Send reminder | Dog | Monthly amount | Previous dues
+// (found by header). Without a "Monthly amount" column the old "Amount due" column is used.
+// Returns { rows, duesColumn }.
 function readPayments_(ss, monitors) {
   const sh = ss.getSheetByName(SYNC.paymentsTab);
-  if (!sh || sh.getLastRow() < 2) return [];
+  if (!sh || sh.getLastRow() < 2) return { rows: [], duesColumn: false };
   const range = sh.getDataRange();
   const shown = range.getDisplayValues(), raw = range.getValues();
   const h = shown[0].map(x => String(x).trim().toLowerCase());
   const col = test => h.findIndex(test);
   const oCol = col(x => x.indexOf('owner') === 0), pCol = col(x => x.indexOf('whatsapp') === 0 || x.indexOf('number') === 0);
-  const aCol = col(x => x.indexOf('amount') === 0), dCol = col(x => x === 'dog');
-  if (pCol === -1 || aCol === -1) return [];
+  const mCol = col(x => x.indexOf('monthly amount') === 0);
+  const aCol = mCol !== -1 ? mCol : col(x => x.indexOf('amount') === 0);
+  const dCol = col(x => x === 'dog'), duesCol = col(x => x.indexOf('previous dues') === 0);
+  if (pCol === -1 || aCol === -1) return { rows: [], duesColumn: false };
   const out = [];
   raw.slice(1).forEach((r, i) => {
     const phone = String(shown[i + 1][pCol]).trim();
     if (!phone || monitors[normalisePhone_(phone)]) return;
-    const a = r[aCol];
-    const amount = typeof a === 'number' ? a : (String(a).replace(/[^0-9.]/g, '') === '' ? null : Number(String(a).replace(/[^0-9.]/g, '')));
     out.push({
       row: i + 2,
       owner: oCol === -1 ? '' : String(shown[i + 1][oCol]).trim(),
       phone: phone,
       dog: dCol === -1 ? '' : String(shown[i + 1][dCol]).trim(),
-      amount: amount,
+      amount: number_(r[aCol], false),
+      previous_dues: duesCol === -1 ? null : number_(r[duesCol], true),
+    });
+  });
+  return { rows: out, duesColumn: duesCol !== -1 };
+}
+
+// Received: WhatsApp number | Date | Amount | Mode | Reference (found by header). null = no tab.
+function readReceived_(ss, monitors) {
+  const sh = ss.getSheetByName(SYNC.receivedTab);
+  if (!sh) return null;
+  if (sh.getLastRow() < 2) return [];
+  const range = sh.getDataRange();
+  const shown = range.getDisplayValues(), raw = range.getValues();
+  const h = shown[0].map(x => String(x).trim().toLowerCase());
+  const col = test => h.findIndex(test);
+  const pCol = col(x => x.indexOf('whatsapp') === 0 || x.indexOf('number') === 0);
+  const dtCol = col(x => x.indexOf('date') === 0), aCol = col(x => x.indexOf('amount') === 0);
+  const mCol = col(x => x.indexOf('mode') === 0), rCol = col(x => x.indexOf('reference') === 0);
+  if (pCol === -1 || dtCol === -1 || aCol === -1) return null;
+  const out = [];
+  raw.slice(1).forEach((r, i) => {
+    const phone = String(shown[i + 1][pCol]).trim();
+    if (!phone && !String(shown[i + 1][aCol]).trim()) return;   // empty row
+    if (monitors[normalisePhone_(phone)]) return;
+    const d = r[dtCol];
+    out.push({
+      row: i + 2,
+      phone: phone,
+      date: d instanceof Date ? Utilities.formatDate(d, SYNC.tz, 'yyyy-MM-dd') : String(shown[i + 1][dtCol]).trim(),
+      amount: number_(r[aCol], false),
+      mode: mCol === -1 ? '' : String(shown[i + 1][mCol]).trim().slice(0, 40),
+      reference: rCol === -1 ? '' : String(shown[i + 1][rCol]).trim().slice(0, 120),
     });
   });
   return out;
+}
+
+// A cell as a number: formulas give their result; "₹8,000" -> 8000; blank -> null.
+function number_(v, allowNegative) {
+  if (typeof v === 'number') return v;
+  const s = String(v).replace(allowNegative ? /[^0-9.\-]/g : /[^0-9.]/g, '');
+  return s === '' || s === '-' || isNaN(Number(s)) ? null : Number(s);
 }
 
 function readKeywords_(ss) {
@@ -253,8 +307,8 @@ function formatIssues_(issues) {
     const tag = i.issue.indexOf('created') === 0 ? 'NEW ' : (i.level === 'info' ? 'OK ' : '');
     const where = (i.tab ? i.tab + ' ' : '') + 'row ' + i.row + ' ';
     const who = (i.owner ? i.owner + ' / ' : '') + (i.dog || '') + (i.date ? ' ' + i.date : '');
-    const extra = i.issue === 'amount_changed' ? ' (' + i.old + ' -> ' + i.new + ')'
-      : i.issue === 'amount_set' ? ' (' + i.amount + ')' : '';
+    const extra = (i.issue === 'amount_changed' || i.issue === 'dues_changed') ? ' (' + i.old + ' -> ' + i.new + ')'
+      : (i.amount !== undefined) ? ' (' + i.amount + ')' : '';
     return tag + where + who + ': ' + i.issue + extra;
   }).join('\n');
 }
