@@ -140,3 +140,41 @@ class OtpCode(Base):
     status: Mapped[str] = mapped_column(String(12), nullable=False, default="sent")  # sent|failed|used|dead|replaced
     wa_message_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class OpeningBalance(Base):
+    """A customer's balance when v2 billing starts, from the Payments tab's "Previous dues".
+
+    dues > 0 = owed before the month started, dues < 0 = paid in advance. Kept in step with
+    the sheet until an admin applies it (app/v2_opening.py); after that it is frozen and the
+    ledger holds it. A customer's money is shown in v2 only once this is applied.
+    """
+    __tablename__ = "opening_balances"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, unique=True)
+    month: Mapped[str] = mapped_column(String(7), nullable=False)  # first month billed in v2
+    dues: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=0)
+    source_rows: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Payments rows, e.g. "12,13"
+    old_balance: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)  # v1 balance replaced
+    ledger_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ledger.id"), nullable=True)
+    applied_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PaymentReceived(Base):
+    """One row of the sheet's Received tab. Posted to the ledger as a credit by an admin."""
+    __tablename__ = "payments_received"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    paid_on: Mapped[Date] = mapped_column(Date, nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    mode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    reference: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    sheet_key: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)  # number|date|amount|reference|n
+    source_row: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    ledger_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ledger.id"), nullable=True)
+    posted_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -23,6 +23,7 @@ from app.auth import create_access_token, get_current_admin, get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.models.v2 import Delivery, Dog, MonthlyAmount
+import app.v2_billing as B
 
 log = logging.getLogger("kmcho.viewas")
 router = APIRouter(tags=["v2 me"])
@@ -86,10 +87,14 @@ async def my_summary(user: User = Depends(get_current_user), db: AsyncSession = 
     holidays = len({r.delivery_date for r in rows if r.billing == "skip"})
     credited = sum((Decimal(r.amount) for r in rows if r.billing == "credit" and r.billed_at is not None and r.amount is not None), Decimal(0))
 
+    # ---- money is shown only once this customer's opening balance is applied (app/v2_opening.py);
+    # before that the v1 balance is stale and nothing has been billed in v2.
+    money_live = await B.opening_applied(db, user.id)
+
     # ---- how long the balance lasts (same share rule as billing, then the month's average rate)
     balance = Decimal(user.current_balance)
     covers_until: Optional[str] = None
-    if amounts and balance > 0:
+    if money_live and amounts and balance > 0:
         per_dog = defaultdict(list)
         for r in rows:
             if r.billing in ("charge", "credit", "hold"):
@@ -119,12 +124,13 @@ async def my_summary(user: User = Depends(get_current_user), db: AsyncSession = 
 
     return {
         "today": today.isoformat(),
-        "balance": money(balance),
+        "money": money_live,
+        "balance": money(balance) if money_live else None,
         "covers_until": covers_until,
         "meals_today": meals_today,
         "month": {"month": month, "delivered": delivered, "planned": planned, "paused_days": paused,
-                  "kitchen_holidays": holidays, "credited": money(credited)},
-        "dogs": [{"id": d.id, "name": d.name, "monthly_amount": money(amounts[d.id]) if d.id in amounts else None} for d in dogs],
+                  "kitchen_holidays": holidays, "credited": money(credited) if money_live else None},
+        "dogs": [{"id": d.id, "name": d.name, "monthly_amount": money(amounts[d.id]) if money_live and d.id in amounts else None} for d in dogs],
     }
 
 

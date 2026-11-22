@@ -11,6 +11,8 @@ The rule (agreed Nov 2026)
   A HOLIDAY spreads the amount over the remaining slots; a PAUSE leaves its share as credit.
 - Only TODAY is billed automatically (nightly). Older unbilled slots wait for an admin.
 - Dogs without a monthly amount for the month are never billed (reported instead).
+- Customers are billed only once their opening balance is applied (app/v2_opening.py);
+  before that a slot reports "no_opening". Ledger debits are dated by the delivery day.
 - Billed rows are locked: later sheet edits that change the billing mode need admin approval,
   which writes the refund / extra debit.
 """
@@ -25,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ledger import Ledger
 from app.models.order import Order
 from app.models.user import User
-from app.models.v2 import Delivery, DeliveryChange, Dog, MonthlyAmount
+from app.models.v2 import Delivery, DeliveryChange, Dog, MonthlyAmount, OpeningBalance
 
 IST = timezone(timedelta(hours=5, minutes=30))
 SLOT_MODES = ("charge", "credit", "hold")
@@ -69,6 +71,12 @@ async def next_share(db: AsyncSession, delivery: Delivery) -> tuple[Optional[Dec
     return (remaining / left).quantize(PAISA, rounding=ROUND_HALF_UP), None
 
 
+async def opening_applied(db: AsyncSession, user_id: int) -> bool:
+    """Nobody is billed in v2 before their opening balance is set (app/v2_opening.py)."""
+    return (await db.execute(select(OpeningBalance.id).where(
+        OpeningBalance.user_id == user_id, OpeningBalance.applied_at.is_not(None)))).first() is not None
+
+
 async def debit(db: AsyncSession, user_id: int, day: Date, amount: Decimal, text: str) -> tuple[Order, Ledger]:
     """Same shape as v1 POST /orders: order + linked ledger debit + cached balance."""
     user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
@@ -77,7 +85,8 @@ async def debit(db: AsyncSession, user_id: int, day: Date, amount: Decimal, text
     db.add(order)
     await db.flush()
     entry = Ledger(user_id=user_id, order_id=order.id, type="debit", amount=amount,
-                   status="completed", description=text)
+                   status="completed", description=text,
+                   created_at=datetime.combine(day, time(12, 0), IST))  # dated by delivery day, for statements
     db.add(entry)
     user.current_balance = Decimal(user.current_balance) - amount
     await db.flush()
@@ -106,6 +115,8 @@ async def bill_delivery(db: AsyncSession, d: Delivery, dog: Dog, now: datetime) 
         return {**base, "result": "already_billed"}
     if d.billing not in ("charge", "credit"):
         return {**base, "result": "not_billable", "billing": d.billing}
+    if not await opening_applied(db, dog.user_id):
+        return {**base, "result": "no_opening"}
     share, why = await next_share(db, d)
     if share is None:
         return {**base, "result": why}
