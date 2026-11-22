@@ -51,7 +51,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, hash_password
@@ -452,6 +452,12 @@ async def sync_schedule(request: Request, db: AsyncSession = Depends(get_db)):
     return {"ok": True, "month": p.month, "stats": dict(stats), "issues": issues}
 
 
+def month_bounds(month: str) -> tuple[Date, Date]:
+    y, m = map(int, month.split("-"))
+    first = Date(y, m, 1)
+    return first, (Date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1))
+
+
 async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_phones=frozenset()) -> None:
     def note(r, issue, level, **extra):
         issues.append({"tab": "Payments", "row": r.row, "owner": r.owner, "dog": r.dog,
@@ -470,30 +476,50 @@ async def apply_payments(db, p, user_by_phone, dog_by_key, issues, stats, admin_
     seen: dict[int, int] = {}
 
     for r in p.payments:
-        if r.amount is None:
-            continue
+        # Blank amount: if the dog's amount was set earlier, clear it (the kitchen emptied the
+        # cell). Rows that don't resolve to a dog are only reported when they carry an amount.
+        blank = r.amount is None
         pn = normalize_phone(r.phone)
         if pn in admin_phones:
-            note(r, "admin_number", "problem")
+            if not blank:
+                note(r, "admin_number", "problem")
             continue
         uid = user_by_phone.get(pn) if pn else None
         if uid is None:
-            note(r, "payments_unknown_number", "problem", phone=r.phone)
+            if not blank:
+                note(r, "payments_unknown_number", "problem", phone=r.phone)
             continue
-        if r.amount < 0:
+        if not blank and r.amount < 0:
             note(r, "payments_negative_amount", "problem", amount=r.amount)
             continue
         if r.dog.strip():
             dog = dog_by_key.get((uid, name_key(r.dog)))
             if dog is None or not dog.active:
-                note(r, "payments_unknown_dog", "problem")
+                if not blank:
+                    note(r, "payments_unknown_dog", "problem")
                 continue
         else:
             mine = dogs_of.get(uid, [])
             if len(mine) != 1:
-                note(r, "payments_dog_required", "problem", dogs=len(mine))
+                if not blank:
+                    note(r, "payments_dog_required", "problem", dogs=len(mine))
                 continue
             dog = mine[0]
+        if blank:
+            m = current.get(dog.id)
+            if m is not None:
+                first, last = month_bounds(p.month)
+                billed = (await db.execute(select(func.count()).where(
+                    Delivery.dog_id == dog.id, Delivery.delivery_date.between(first, last),
+                    Delivery.billed_at.is_not(None)))).scalar_one()
+                if billed:
+                    note(r, "amount_blank_after_billing", "problem", amount=float(m.amount), dog=dog.name)
+                else:
+                    note(r, "amount_cleared", "info", old=float(m.amount), new=None, dog=dog.name)
+                    await db.delete(m)
+                    current.pop(dog.id)
+                    stats["amounts_cleared"] += 1
+            continue
         if dog.id in seen:
             note(r, "payments_duplicate", "problem", first_row=seen[dog.id])
             continue

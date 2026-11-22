@@ -128,6 +128,59 @@ async def bill_delivery(db: AsyncSession, d: Delivery, dog: Dog, now: datetime) 
     return {**base, "result": "charged" if d.billing == "charge" else "credited", "amount": float(share)}
 
 
+async def bill_dog_slots(db: AsyncSession, dog: Dog, user: User, slots: list[Delivery], now: datetime) -> list[dict]:
+    """Bill many unbilled charge/credit slots of one dog in one month, oldest first.
+
+    Same result as calling bill_delivery() on each in date order (same share rule: remaining
+    ÷ unbilled slots, last slot takes the remainder), but with a handful of queries per dog
+    instead of ~9 per day, so a month of catch-up billing finishes in seconds over a slow
+    database link. Caller holds row locks on `slots` and `user`, and has checked the opening.
+    """
+    if not slots:
+        return []
+    month, first, last = month_of(slots[0].delivery_date)
+    assert all(month_of(d.delivery_date)[0] == month for d in slots), "one month at a time"
+    base = lambda d: {"delivery_id": d.id, "dog": dog.name, "date": d.delivery_date.isoformat()}
+    amount = (await db.execute(select(MonthlyAmount.amount).where(
+        MonthlyAmount.dog_id == dog.id, MonthlyAmount.month == month))).scalar_one_or_none()
+    if amount is None:
+        return [{**base(d), "result": "no_amount"} for d in slots]
+    in_month = (Delivery.dog_id == dog.id, Delivery.delivery_date.between(first, last),
+                Delivery.billing.in_(SLOT_MODES))
+    used = Decimal((await db.execute(select(func.coalesce(func.sum(Delivery.amount), 0))
+                                     .where(*in_month, Delivery.billed_at.is_not(None)))).scalar_one())
+    left = (await db.execute(select(func.count()).where(*in_month, Delivery.billed_at.is_(None)))).scalar_one()
+
+    results, charges = [], []
+    for d in sorted(slots, key=lambda x: (x.delivery_date, x.id)):
+        remaining = Decimal(amount) - used
+        share = (Decimal("0.00") if remaining <= 0 else remaining.quantize(PAISA) if left == 1
+                 else (remaining / left).quantize(PAISA, rounding=ROUND_HALF_UP))
+        used += share
+        left -= 1
+        d.amount, d.billed_at = share, now
+        if d.billing == "charge":
+            charges.append((d, share))
+        results.append({**base(d), "result": "charged" if d.billing == "charge" else "credited",
+                        "amount": float(share)})
+
+    # Orders first (their ids go on the ledger rows), then ledger debits: two batched inserts.
+    orders = [Order(user_id=user.id, status="delivered", description=describe(dog.name, d),
+                    order_date=datetime.combine(d.delivery_date, time(12, 0), IST)) for d, _ in charges]
+    db.add_all(orders)
+    await db.flush()
+    entries = [Ledger(user_id=user.id, order_id=o.id, type="debit", amount=share, status="completed",
+                      description=describe(dog.name, d), created_at=datetime.combine(d.delivery_date, time(12, 0), IST))
+               for o, (d, share) in zip(orders, charges)]
+    db.add_all(entries)
+    await db.flush()
+    for o, e, (d, share) in zip(orders, entries, charges):
+        d.order_id, d.billed_ledger_id = o.id, e.id
+        user.current_balance = Decimal(user.current_balance) - share
+    await db.flush()
+    return results
+
+
 async def bill_day(db: AsyncSession, day: Date) -> dict:
     """Bill every unbilled slot on `day`. Idempotent; safe to run twice."""
     now = datetime.now(timezone.utc)

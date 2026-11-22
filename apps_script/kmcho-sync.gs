@@ -307,7 +307,7 @@ function formatIssues_(issues) {
     const tag = i.issue.indexOf('created') === 0 ? 'NEW ' : (i.level === 'info' ? 'OK ' : '');
     const where = (i.tab ? i.tab + ' ' : '') + 'row ' + i.row + ' ';
     const who = (i.owner ? i.owner + ' / ' : '') + (i.dog || '') + (i.date ? ' ' + i.date : '');
-    const extra = (i.issue === 'amount_changed' || i.issue === 'dues_changed') ? ' (' + i.old + ' -> ' + i.new + ')'
+    const extra = (i.issue === 'amount_changed' || i.issue === 'dues_changed' || i.issue === 'amount_cleared') ? ' (' + i.old + ' -> ' + i.new + ')'
       : (i.amount !== undefined) ? ' (' + i.amount + ')' : '';
     return tag + where + who + ': ' + i.issue + extra;
   }).join('\n');
