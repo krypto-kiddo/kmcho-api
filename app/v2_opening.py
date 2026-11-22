@@ -11,7 +11,8 @@ For each customer (or the user_ids given), in one transaction:
 2. Payments received (Received tab) not yet posted -> ledger credits, dated the day paid.
    Only payments from this month on: older ones belong inside "Previous dues".
 3. This month's unbilled meal/pause days before today are billed, oldest first, with the
-   normal rules (app/v2_billing.py). Today and later are left for nightly billing.
+   normal rules (app/v2_billing.py, bill_dog_slots: batched per dog, so it stays fast over
+   Railway -> Supabase). Today and later are left for nightly billing.
 Safe to run again: done steps are skipped, so a re-run after fixing a missing monthly
 amount just bills the remaining days and posts new payments.
 """
@@ -25,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ledger import Ledger
 from app.models.user import User
 from app.models.v2 import Delivery, Dog, OpeningBalance, PaymentReceived
-from app.v2_billing import IST, bill_delivery, month_of, today_ist
+from app.v2_billing import IST, bill_dog_slots, month_of, today_ist
 
 ZERO = Decimal("0.00")
 
@@ -117,12 +118,17 @@ async def run_opening(db: AsyncSession, admin_id: int, user_ids: Optional[list[i
             .order_by(Delivery.delivery_date, Delivery.id).with_for_update(of=Delivery)
         )).all()
         charged, credited, n_charged, n_credited = ZERO, ZERO, 0, 0
+        by_dog: dict[int, tuple[Dog, list[Delivery]]] = {}
         for d, dog in rows:
             if d.billing == "hold":
                 problems.append({"what": "sheet_error", "dog": dog.name, "date": d.delivery_date.isoformat(),
                                  "value": d.raw_value})
                 continue
-            r = await bill_delivery(db, d, dog, now)
+            by_dog.setdefault(dog.id, (dog, []))[1].append(d)
+        billed = []
+        for dog, slots in by_dog.values():
+            billed += await bill_dog_slots(db, dog, u, slots, now)
+        for r in billed:
             if r["result"] == "charged":
                 charged += Decimal(str(r["amount"]))
                 n_charged += 1
@@ -130,7 +136,7 @@ async def run_opening(db: AsyncSession, admin_id: int, user_ids: Optional[list[i
                 credited += Decimal(str(r["amount"]))
                 n_credited += 1
             else:
-                problems.append({"what": r["result"], "dog": dog.name, "date": d.delivery_date.isoformat()})
+                problems.append({"what": r["result"], "dog": r["dog"], "date": r["date"]})
         row["past_days"] = {"meals": n_charged, "charged": money(charged),
                             "paused": n_credited, "kept_as_credit": money(credited)}
         row["problems"] = problems
